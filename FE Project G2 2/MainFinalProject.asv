@@ -1,0 +1,314 @@
+%
+% Financial Engineering Project G2
+% Financial Engineering Course
+%
+%
+% -*- -*- -*-  GROUP  -*- -*- -*-
+%
+% Lepore      Marco
+%
+% Lunardi     Chiara
+%
+% Masatti     Gabriele Giovanni
+%
+% -*- -*- -*- -*- -*- -*- -*- -*- -*-
+%
+%
+% Academic Year 2021 - 2022
+%
+% RunMain
+
+%% clearing
+close all
+clear all
+clc
+warning off
+
+%% Calibration of Forwards and Discount factors
+% pay attention to computer settings
+formatData = 'yyyy-mm-dd'; 
+inputfile  = 'S&P_500_2019-06-07_2.xlsx';
+
+% setting data
+if ispc()   
+    [optionData] = readExcelData(inputfile, formatData);
+else    
+    [optionData] = readExcelDataMacOS(inputfile);
+end
+setDate      = optionData.settlement;
+S0           = 2873.3;                % initial underlying price
+IBDaycount   = 3;                     % daycount convention
+
+% use tables
+optionTable            = table;
+optionTable.ASK        = optionData.askPrices;
+optionTable.BID        = optionData.bidPrices;
+optionTable.STRIKES    = optionData.strikes;
+optionTable.MATURITIES = optionData.maturities;
+optionTable.OPENING    = optionData.opening;
+optionTable.FLAG       = optionData.flag;
+
+
+%% removing right options (applying liquidity constraints)
+optionTable = liquidityConstraints(optionTable);
+
+
+%% Bootstrap of implied discounts with close formula (uncomment to check)
+% [dates1, discounts1, Forwards1] = bootstrapMarketDiscounts(optionTable);
+
+
+%% Bootstrap of implied discounts with linear regression
+[Dates, Discounts, Forwards] = bootstrapMarketDiscountslm(optionTable);
+TTM                          = yearfrac(setDate, Dates, IBDaycount);
+zRates                       = 0.01*zeroRates(setDate, Dates, Discounts);
+dividends                    = zRates - (1./TTM.*log(Forwards/S0));
+
+
+%% calibration of the ATS
+discountCurve                             = table;
+discountCurve.dates                       = Dates;
+discountCurve.discounts                   = Discounts;
+
+% calibration of ATS NIG (calls & puts OTM), uncomment to try other (only calls, only puts OTM... )
+% [eta, k, sigma, MSE, MAPE] = calibrateATSNIG(setDate, optionTable, Forwards, discountCurve, 0); % only calls 
+% [eta, k, sigma, MSE, MAPE] = calibrateATSNIG(setDate, optionTable, Forwards, discountCurve, 1); % only puts 
+[eta, k, sigma, MSE, MAPE] = calibrateATSNIG(setDate, optionTable, Forwards, discountCurve, 2);
+
+% calibration of LTS NIG (calls & puts OTM)
+[etaNIG, kNIG, sigmaNIG, MSENIG, MAPENIG] = calibrateNIGcallput(setDate, optionTable, Forwards, discountCurve);
+
+% uncomment to calibrate on ITM options
+% [etaITM, kITM, sigmaITM, MSEITM, MAPEITM] = calibrateATSNIGcallputITM(setDate, optionTable, Forwards, discountCurve);
+
+% plot of the errors (log10)
+figure();
+plot(TTM, log10(MSE),'LineWidth',2, 'LineStyle','--', 'Marker', 'pentagram','MarkerSize', 8, 'Color','r')
+hold on
+plot(TTM, log10(MSENIG), 'LineWidth',2, 'LineStyle','--', 'Marker', 'pentagram','MarkerSize', 8,'Color','k')
+grid on 
+set(gca, 'color',[150 147 190]./255)
+xlabel('TTM')
+ylabel('log10MSE')
+legend('ATS', 'LTS')
+
+% plot of the parameters
+f = figure();
+sf1 = subplot(1, 3, 1);
+plot(TTM, eta, 'LineStyle','-', 'Marker', 'square', 'Color','k', 'LineWidth',2)
+grid on 
+title('eta')
+sf2 = subplot(1, 3, 2);
+plot(TTM, sigma, 'LineStyle','-', 'Marker', 'square', 'Color','r', 'LineWidth',2)
+grid on
+title('sigma')
+sf3 = subplot(1, 3, 3);
+plot(TTM, k, 'LineStyle','-', 'Marker', 'square', 'Color','b', 'LineWidth',2)
+grid on
+title('k')
+
+% verifying that assumptions for the ATS hold
+alpha = 0.5;
+[flag1, flag2 ] = ATSassumptions(k, eta, sigma, TTM, alpha);
+
+%% fitting the power law & verifying assumptions
+[etabar, kbar, beta, delta, theta, sigmabar, gamma] = powerLawScaling(sigma, eta, k, setDate, Dates);
+
+
+%% Power law smile reproductions
+ktheta   = kbar.*TTM.^beta;
+etatheta = etabar.*TTM.^(delta);
+
+% plot of the parameters of the PL
+figure()
+sf1 = subplot(1, 2, 1);
+plot(TTM, etatheta, 'LineStyle','-', 'Marker', 'square', 'Color','k', 'LineWidth',2)
+grid on 
+title('etaPL')
+sf3 = subplot(1, 2, 2);
+plot(TTM, ktheta, 'LineStyle','-', 'Marker', 'square', 'Color','b', 'LineWidth',2)
+grid on
+title('kPL')
+
+
+% verifying that power-Law assumptions are satisfied
+[flag]               = powerLawConditions(beta, delta, alpha);
+[flageta1, flageta2] = ATSassumptions(ktheta, etatheta, sigmabar*ones(length(TTM), 1), TTM, alpha);
+
+%% Simulation of forward increment (of S_t)
+t          = yearfrac(setDate, Dates(2), IBDaycount);
+s          = yearfrac(setDate, Dates(1), IBDaycount); 
+M          = 12;
+Nsim       = 1e6;
+flagspline = 1;
+[X1]       = simulateATS(M, Nsim, flagspline, s, 0, sigma(1), sigma(1), eta(1), eta(1), k(1), k(1), 0);
+
+% simulating a fwd increment of S
+[X2]       = simulateATS(M, Nsim, flagspline, t, s, sigma(2), sigma(1), eta(2), eta(1), k(2), k(1), 0);
+F          = (Forwards(1).*exp(X1)); %F1
+fwdR       = forwardRate(Dates(2), Dates(1), Discounts(2), Discounts(1));
+S1         = (F).*exp((fwdR - dividends(2))*(yearfrac(Dates(1), Dates(2), IBDaycount))).*exp(X2);
+St1        = mean(S1); %S2
+%%fare come dico io sull'ipad
+
+% % trying from zero (almost identical)
+% [X3]       = simulateATS(M, Nsim, flagspline, t, 0, sigma(2), sigma(1), eta(2), eta(1), k(2), k(1), 0);
+% S2         = (Forwards(2).*exp(X3));
+% St2        = mean(S2);
+
+
+%% 30 European call options pricing
+maturity        = datenum('2019-06-19');
+TTMCall         = yearfrac(setDate, maturity, IBDaycount);  % yearfrac to maturity
+moneyness       = sqrt(TTMCall) .*linspace(-0.2, 0.2, 30)'; % moneyness grid
+
+% PL ATS parameters
+kTTM            = kbar.*TTMCall.^beta;
+etaTTM          = etabar.*TTMCall.^delta;
+sigmaTTM        = sigmabar;
+% sigmaTTM        = interp1(Dates, sigma, maturity, "linear", 'extrap');
+
+% interpolation (extrapolation) of rate & forward
+rate            = interp1(Dates, zRates, maturity, 'linear', 'extrap');    % (just 2 days extrapolation... )
+discount        = exp(-rate*TTMCall);
+dvdnd           = interp1(Dates, dividends, maturity, 'linear', 'extrap'); % (just 2 days extrapolation... )
+fwd             = S0*exp((rate-dvdnd)*TTMCall);                            % initial forward price
+
+% calibration of FFT optimal parameters
+I_res           = 2*pi.*exp(-sign(moneyness)*0.5.*moneyness);
+M               = 15;
+options         = optimset('TolFun',1e-5);
+x0              = 0.0025;
+LB              = eps;
+UB              = 0.01;
+fTS             = @(v) 1./(v.^2 + 0.25);
+ff              = @(x) 1./(x.^2 + 1/4);
+dz              = lsqnonlin(@(dz) abs(FourierTransform(fTS, moneyness,  M, dz)- I_res), x0, LB, UB, options); % find dz such that FFT replicates the residual integral
+% dz              = 0.0025;
+Params          = FFTparameters(M, dz, 1);
+
+%% computing prices with closed formula (uncomment below for quadrature)
+
+% price of the options with FFT-Lewis formula
+priceFFT        = CallPricesNMVMFFT(fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], Params, alpha);
+
+% change flag in CallPricesNMVMFFT when calling computeIntegral to run Quadrature (below)
+% priceQuadrature = CallPricesNMVMFFT(fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], Params, alpha);
+
+%% Using Lewis-FFT algorithm 
+M               = 12;
+Nsim            = 1e6;
+[PricesLewisFFTS, ~, ~] = CallPricesLewisFFTS(fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], M, Nsim, 1);
+[PricesLewisFFTL, ~, ~] = CallPricesLewisFFTS(fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], M, Nsim, 2);
+
+% plot of the prices
+figure()
+plot(moneyness, priceFFT, '*', 'MarkerSize', 5)
+hold on
+plot(moneyness, PricesLewisFFTS, '+', 'MarkerSize', 5)
+hold on
+plot(moneyness, PricesLewisFFTL, 'square', 'MarkerSize', 5)
+grid on
+legend('pricesFFT', 'pricesLewisFFTS', 'pricesLewisFFTL')
+xlabel('Moneyness')
+ylabel('Call prices')
+
+%% Errors
+RMSES   = sqrt(mean((PricesLewisFFTS - priceFFT').^2));
+MAPES   = mean(100.*abs(priceFFT' - PricesLewisFFTS)./priceFFT');
+MAXERRS = max(abs(priceFFT' - PricesLewisFFTS));
+RMSEL   = sqrt(mean((PricesLewisFFTL - priceFFT').^2));
+MAPEL   = mean(100.*abs(priceFFT' - PricesLewisFFTL)./priceFFT');
+MAXERRL = max(abs(priceFFT' - PricesLewisFFTL));
+
+% display the errors in a table 
+T = array2table([RMSEL, MAPEL, MAXERRL; RMSES, MAPES, MAXERRS],'VariableNames',{'RMSE (€)', 'MAPE (%)', 'MAXERROR (€)'}, 'RowNames',{'Linear', 'Spline'});
+fprintf('\n')
+disp(T)
+
+%% Making a comparison between Spline & Linear varying M
+Nsim    = 1e6;
+Mvec    = [7:13]';
+SD      = zeros(length(Mvec),1);
+RMSES   = zeros(length(Mvec),1);
+RMSEL   = zeros(length(Mvec),1);
+MAPES   = zeros(length(Mvec),1);
+MAPEL   = zeros(length(Mvec),1);
+MAXERRS = zeros(length(Mvec),1);
+MAXERRL = zeros(length(Mvec),1);
+
+% varying M
+for i=1:length(Mvec)
+    [PricesLewisFFTS, ~, SD(i)] = CallPricesLewisFFTS( fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], Mvec(i), Nsim, 1);
+    [PricesLewisFFTL, ~] = CallPricesLewisFFTS( fwd, discount, moneyness, TTMCall, [sigmaTTM, etaTTM, kTTM], Mvec(i), Nsim, 2);
+    RMSES(i)   = sqrt(mean((PricesLewisFFTS - priceFFT').^2));
+    MAPES(i)   = mean(100.*abs(priceFFT' - PricesLewisFFTS)./priceFFT');
+    MAXERRS(i) = max(abs(priceFFT' - PricesLewisFFTS));
+    RMSEL(i)   = sqrt(mean((PricesLewisFFTL - priceFFT').^2));
+    MAPEL(i)   = mean(100.*abs(priceFFT' - PricesLewisFFTL)./priceFFT');
+    MAXERRL(i) = max(abs(priceFFT' - PricesLewisFFTL));
+end
+
+% plot of the log10 errors
+figure()
+plot(Mvec, log10(MAXERRS), '--', 'Marker', 'square', 'LineWidth',2)
+hold on
+plot(Mvec, log10(MAXERRL), '--', 'Marker', 'square', 'LineWidth',2)
+hold on
+grid on
+% axis([5 13 -1.8 1.5])
+xlabel('M')
+ylabel('log_{10}MAX')
+legend('MAXERRORS', 'MAXERRORL')
+
+
+%% Sprint autocallable put with ATS simulation
+M                               = 12;
+strike                          = 2500;
+Nsim                            = 1e6;
+t1                              = datenum('2019-07-09');
+PaymentDates                    = [t1; dateMoveVec(t1,'m', [1:11], 'MF', eurCalendar())];
+ResetDates                      = dateMoveVec(PaymentDates,'d', -2, 'MF', eurCalendar());
+TTMResetDates                   = yearfrac(setDate, ResetDates, IBDaycount);
+OptionSprintParams.ResetDates   = ResetDates;
+OptionSprintParams.PaymentDates = PaymentDates;
+OptionSprintParams.strike       = strike;
+OptionSprintParams.Forwards     = Forwards;
+OptionSprintParams.S0           = S0;
+UnderlyingParams.sigma          = sigma;
+UnderlyingParams.eta            = eta;
+UnderlyingParams.k              = k;
+UnderlyingParams.alpha          = alpha;
+UnderlyingParams.dividends      = dividends;
+[PutPrice, PutIC,S]               = AutocallablePutPricing(OptionSprintParams, UnderlyingParams, setDate, discountCurve, M, Nsim, flagspline);
+%%
+
+figure
+plot([setDate;ResetDates],S)
+gx=gca;
+gx.XTick=[setDate;ResetDates];
+gx.XTickLabelRotation = 30;
+datetick('x',1,'keepticks')
+grid on
+title('Simulation of undelying')
+%% Sprint autocallable put with LTS simulation
+UnderlyingParamsNIG.sigma     = sigmaNIG*ones(length(ResetDates),1);
+UnderlyingParamsNIG.eta       = etaNIG*ones(length(ResetDates),1); 
+UnderlyingParamsNIG.k         = kNIG*ones(length(ResetDates),1);
+UnderlyingParamsNIG.alpha     = alpha;
+UnderlyingParamsNIG.dividends = dividends;
+[PutPriceNIG, PutNIGIC]       = AutocallablePutPricing(OptionSprintParams, UnderlyingParamsNIG, setDate, discountCurve, M, Nsim, flagspline);
+
+%% Sprint autocallable put with Power Law ATS simulation
+UnderlyingParamsPowerLaw.sigma     = sigmabar*ones(length(ResetDates),1);
+UnderlyingParamsPowerLaw.eta       = etabar.*TTMResetDates.^delta;
+UnderlyingParamsPowerLaw.k         = kbar.*TTMResetDates.^beta;
+UnderlyingParamsPowerLaw.alpha     = alpha;
+UnderlyingParamsPowerLaw.dividends = dividends;
+[PutPricePL, PutPLIC]              = AutocallablePutPricingPL(OptionSprintParams, UnderlyingParamsPowerLaw, setDate, discountCurve, M, Nsim, flagspline);
+
+% output
+percErrorNIG = 100*abs(PutPriceNIG - PutPrice)/PutPrice;
+percErrorPL  = 100*abs(PutPricePL - PutPrice)/PutPrice;
+T = array2table([PutPrice, PutPriceNIG, PutPricePL],'VariableNames',{'Sprint Autocallable Put Price FFTS (€)', 'Sprint Autocallable Put Price MCNIG (€)', 'Sprint Autocallable Put Price FFTS PL (€)'});
+fprintf('\n')
+disp(T)
